@@ -14,7 +14,7 @@ export class ApolloServer extends ApolloServerBase {
   }
 
   public async listen() {
-    await this.willStart();
+    await this.start();  // FIXME maybe
     addEventListener('fetch', (event: FetchEvent) => {
       event.respondWith(
         graphqlCloudflare(() => {

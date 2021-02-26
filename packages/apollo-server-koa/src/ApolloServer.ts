@@ -113,11 +113,11 @@ export class ApolloServer extends ApolloServerBase {
     // call `next` until it's ready, which will effectively yield until that
     // work has finished.  Any errors will be surfaced to Koa through its own
     // native Promise-catching facilities.
-    const promiseWillStart = this.willStart();
+    // FIXME const promiseWillStart = this.willStart();
     const middlewares = [];
     middlewares.push(
       middlewareFromPath(path, async (_ctx: Koa.Context, next: Function) => {
-        await promiseWillStart;
+        // FIXME await promiseWillStart;
         return next();
       }),
     );

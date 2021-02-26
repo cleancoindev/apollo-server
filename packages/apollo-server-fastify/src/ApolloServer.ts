@@ -85,12 +85,12 @@ export class ApolloServer extends ApolloServerBase {
     onHealthCheck,
   }: ServerRegistration = {}) {
     this.graphqlPath = path ? path : '/graphql';
-    const promiseWillStart = this.willStart();
+    // FIXME const promiseWillStart = this.willStart();
 
     return async (
       app: FastifyInstance<Server, IncomingMessage, ServerResponse>,
     ) => {
-      await promiseWillStart;
+      // FIXME await promiseWillStart;
 
       if (!disableHealthCheck) {
         app.get('/.well-known/apollo/server-health', async (req, res) => {

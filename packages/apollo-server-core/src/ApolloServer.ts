@@ -21,7 +21,6 @@ import {
   DocumentNode,
   isObjectType,
   isScalarType,
-  isSchema,
 } from 'graphql';
 import { GraphQLExtension } from 'graphql-extensions';
 import {
@@ -55,6 +54,7 @@ import {
   SubscriptionServerOptions,
   FileUploadOptions,
   PluginDefinition,
+  GraphQLService,
 } from './types';
 
 import { gql } from './index';
@@ -128,7 +128,9 @@ export class ApolloServerBase {
   private logger: Logger;
   public subscriptionsPath?: string;
   public graphqlPath: string = '/graphql';
-  public requestOptions: Partial<GraphQLServerOptions<any>> = Object.create(null);
+  public requestOptions: Partial<GraphQLServerOptions<any>> = Object.create(
+    null,
+  );
 
   private context?: Context | ContextFunction;
   private apolloConfig: ApolloConfig;
@@ -144,13 +146,13 @@ export class ApolloServerBase {
   protected playgroundOptions?: PlaygroundRenderPageOptions;
 
   private parseOptions: GraphQLParseOptions;
-  private schemaDerivedData: Promise<SchemaDerivedData>;
+  // This is assigned when `start` returns successfully.
+  private schemaDerivedData?: SchemaDerivedData;
   private config: Config;
   /** @deprecated: This is undefined for servers operating as gateways, and will be removed in a future release **/
   protected schema?: GraphQLSchema;
   private toDispose = new Set<() => Promise<void>>();
-  private experimental_approximateDocumentStoreMiB:
-    Config['experimental_approximateDocumentStoreMiB'];
+  private experimental_approximateDocumentStoreMiB: Config['experimental_approximateDocumentStoreMiB'];
 
   // The constructor should be universal across all environments. All environment specific behavior should be set by adding or overriding methods
   constructor(config: Config) {
@@ -194,7 +196,7 @@ export class ApolloServerBase {
       this.logger = config.logger;
     } else {
       // If the user didn't provide their own logger, we'll initialize one.
-      const loglevelLogger = loglevel.getLogger("apollo-server");
+      const loglevelLogger = loglevel.getLogger('apollo-server');
 
       // We don't do much logging in Apollo Server right now.  There's a notion
       // of a `debug` flag, which changes stack traces in some error messages,
@@ -246,10 +248,8 @@ export class ApolloServerBase {
     }
 
     if (requestOptions.persistedQueries !== false) {
-      const {
-        cache: apqCache = requestOptions.cache!,
-        ...apqOtherOptions
-      } = requestOptions.persistedQueries || Object.create(null);
+      const { cache: apqCache = requestOptions.cache!, ...apqOtherOptions } =
+        requestOptions.persistedQueries || Object.create(null);
 
       requestOptions.persistedQueries = {
         cache: new PrefixingKeyValueCache(apqCache, APQ_CACHE_PREFIX),
@@ -324,21 +324,6 @@ export class ApolloServerBase {
 
     this.playgroundOptions = createPlaygroundOptions(playground);
 
-    // TODO: This is a bit nasty because the subscription server needs this.schema synchronously, for reasons of backwards compatibility.
-    const _schema = this.initSchema();
-
-    if (isSchema(_schema)) {
-      const derivedData = this.generateSchemaDerivedData(_schema);
-      this.schema = derivedData.schema;
-      this.schemaDerivedData = Promise.resolve(derivedData);
-    } else if (typeof _schema.then === 'function') {
-      this.schemaDerivedData = _schema.then(schema =>
-        this.generateSchemaDerivedData(schema),
-      );
-    } else {
-      throw new Error("Unexpected error: Unable to resolve a valid GraphQLSchema.  Please file an issue with a reproduction of this error, if possible.");
-    }
-
     // Plugins will be instantiated if they aren't already, and this.plugins
     // is populated accordingly.
     this.ensurePluginInstantiation(plugins);
@@ -377,184 +362,24 @@ export class ApolloServerBase {
     this.graphqlPath = path;
   }
 
-  private initSchema(): GraphQLSchema | Promise<GraphQLSchema> {
-    const {
-      gateway,
-      schema,
-      modules,
-      typeDefs,
-      resolvers,
-      schemaDirectives,
-      parseOptions,
-    } = this.config;
-    if (gateway) {
-      // Store the unsubscribe handles, which are returned from
-      // `onSchemaChange`, for later disposal when the server stops
-      const unsubscriber = gateway.onSchemaChange(
-        (schema) =>
-          (this.schemaDerivedData = Promise.resolve(
-            this.generateSchemaDerivedData(schema),
-          )),
-      );
-      this.toDispose.add(async () => unsubscriber());
-
-      // For backwards compatibility with old versions of @apollo/gateway.
-      const engineConfig =
-        this.apolloConfig.keyHash && this.apolloConfig.graphId
-          ? {
-              apiKeyHash: this.apolloConfig.keyHash,
-              graphId: this.apolloConfig.graphId,
-              graphVariant: this.apolloConfig.graphVariant,
-            }
-          : undefined;
-
-      // Set the executor whether the gateway 'load' call succeeds or not.
-      // If the schema becomes available eventually (after a setInterval retry)
-      // this executor will still be necessary in order to be able to support
-      // a federated schema!
-      this.requestOptions.executor = gateway.executor;
-
-      return gateway
-        .load({ apollo: this.apolloConfig, engine: engineConfig })
-        .then((config) => {
-          this.toDispose.add(async () => await gateway.stop?.());
-          return config.schema;
-        })
-        .catch((err) => {
-          // We intentionally do not re-throw the exact error from the gateway
-          // configuration as it may contain implementation details and this
-          // error will propagate to the client. We will, however, log the error
-          // for observation in the logs.
-          const message = 'This data graph is missing a valid configuration.';
-          this.logger.error(message + ' ' + ((err && err.message) || err));
-          throw new Error(
-            message + ' More details may be available in the server logs.',
-          );
-        });
-    }
-
-    let constructedSchema: GraphQLSchema;
-    if (schema) {
-      constructedSchema = schema;
-    } else if (modules) {
-      const { schema, errors } = buildServiceDefinition(modules);
-      if (errors && errors.length > 0) {
-        throw new Error(errors.map(error => error.message).join('\n\n'));
-      }
-      constructedSchema = schema!;
-    } else {
-      if (!typeDefs) {
-        throw Error(
-          'Apollo Server requires either an existing schema, modules or typeDefs',
-        );
-      }
-
-      const augmentedTypeDefs = Array.isArray(typeDefs) ? typeDefs : [typeDefs];
-
-      // We augment the typeDefs with the @cacheControl directive and associated
-      // scope enum, so makeExecutableSchema won't fail SDL validation
-
-      if (!isDirectiveDefined(augmentedTypeDefs, 'cacheControl')) {
-        augmentedTypeDefs.push(
-          gql`
-            enum CacheControlScope {
-              PUBLIC
-              PRIVATE
-            }
-
-            directive @cacheControl(
-              maxAge: Int
-              scope: CacheControlScope
-            ) on FIELD_DEFINITION | OBJECT | INTERFACE
-          `,
-        );
-      }
-
-      if (this.uploadsConfig) {
-        const { GraphQLUpload } = require('@apollographql/graphql-upload-8-fork');
-        if (Array.isArray(resolvers)) {
-          if (resolvers.every(resolver => !resolver.Upload)) {
-            resolvers.push({ Upload: GraphQLUpload });
-          }
-        } else {
-          if (resolvers && !resolvers.Upload) {
-            resolvers.Upload = GraphQLUpload;
-          }
-        }
-
-        // We augment the typeDefs with the Upload scalar, so typeDefs that
-        // don't include it won't fail
-        augmentedTypeDefs.push(
-          gql`
-            scalar Upload
-          `,
-        );
-      }
-
-      constructedSchema = makeExecutableSchema({
-        typeDefs: augmentedTypeDefs,
-        schemaDirectives,
-        resolvers,
-        parseOptions,
-      });
-    }
-
-    return constructedSchema;
-  }
-
-  private generateSchemaDerivedData(schema: GraphQLSchema): SchemaDerivedData {
-    const schemaHash = generateSchemaHash(schema!);
-
-    const { mocks, mockEntireSchema, extensions: _extensions } = this.config;
-
-    if (mocks || (typeof mockEntireSchema !== 'undefined' && mocks !== false)) {
-      addMockFunctionsToSchema({
-        schema,
-        mocks:
-          typeof mocks === 'boolean' || typeof mocks === 'undefined'
-            ? {}
-            : mocks,
-        preserveResolvers:
-          typeof mockEntireSchema === 'undefined' ? false : !mockEntireSchema,
-      });
-    }
-
-    const extensions = [];
-
-    // Note: doRunQuery will add its own extensions if you set tracing,
-    // or cacheControl.
-    extensions.push(...(_extensions || []));
-
-    // Initialize the document store.  This cannot currently be disabled.
-    const documentStore = this.initializeDocumentStore();
-
-    return {
-      schema,
-      schemaHash,
-      extensions,
-      documentStore,
-    };
-  }
-
-  protected async willStart() {
-    try {
-      var { schema, schemaHash } = await this.schemaDerivedData;
-    } catch (err) {
-      // The `schemaDerivedData` can throw if the Promise it points to does not
-      // resolve with a `GraphQLSchema`. As errors from `willStart` are start-up
-      // errors, other Apollo middleware after us will not be called, including
-      // our health check, CORS, etc.
-      //
-      // Returning here allows the integration's other Apollo middleware to
-      // function properly in the event of a failure to obtain the data graph
-      // configuration from the gateway's `load` method during initialization.
-      return;
+  // The main goal of start is to assign to schemaDerivedData FIXME
+  // We must make sure that we manage the schemaDerivedData line before
+  // awaiting in the !gateway case, for installSubscriptionHandlers reasons
+  public async start(): Promise<void> {
+    const { gateway } = this.config;
+    const schema = gateway
+      ? await this.startGatewayAndLoadSchema(gateway)
+      : this.constructSchema();
+    this.schemaDerivedData = this.generateSchemaDerivedData(schema);
+    if (!gateway) {
+      // This deprecated field was only ever set for non-gateway FIXME
+      this.schema = schema;
     }
 
     const service: GraphQLServiceContext = {
       logger: this.logger,
       schema: schema,
-      schemaHash: schemaHash,
+      schemaHash: this.schemaDerivedData.schemaHash,
       apollo: this.apolloConfig,
       serverlessFramework: this.serverlessFramework(),
       engine: {
@@ -595,12 +420,163 @@ export class ApolloServerBase {
     });
   }
 
+  private async startGatewayAndLoadSchema(
+    gateway: GraphQLService,
+  ): Promise<GraphQLSchema> {
+    // Store the unsubscribe handles, which are returned from
+    // `onSchemaChange`, for later disposal when the server stops
+    const unsubscriber = gateway.onSchemaChange((schema) => {
+      this.schemaDerivedData = this.generateSchemaDerivedData(schema);
+    });
+    this.toDispose.add(async () => unsubscriber());
+
+    // For backwards compatibility with old versions of @apollo/gateway.
+    const engineConfig =
+      this.apolloConfig.keyHash && this.apolloConfig.graphId
+        ? {
+            apiKeyHash: this.apolloConfig.keyHash,
+            graphId: this.apolloConfig.graphId,
+            graphVariant: this.apolloConfig.graphVariant,
+          }
+        : undefined;
+
+    // Set the executor whether the gateway 'load' call succeeds or not.
+    // FIXME rethink this
+    this.requestOptions.executor = gateway.executor;
+
+    const config = await gateway.load({
+      apollo: this.apolloConfig,
+      engine: engineConfig,
+    });
+    this.toDispose.add(async () => await gateway.stop?.());
+    return config.schema;
+  }
+
+  private constructSchema(): GraphQLSchema {
+    const {
+      schema,
+      modules,
+      typeDefs,
+      resolvers,
+      schemaDirectives,
+      parseOptions,
+    } = this.config;
+    if (schema) {
+      return schema;
+    }
+
+    if (modules) {
+      const { schema, errors } = buildServiceDefinition(modules);
+      if (errors && errors.length > 0) {
+        throw new Error(errors.map((error) => error.message).join('\n\n'));
+      }
+      return schema!;
+    }
+
+    if (!typeDefs) {
+      throw Error(
+        'Apollo Server requires either an existing schema, modules or typeDefs',
+      );
+    }
+
+    const augmentedTypeDefs = Array.isArray(typeDefs) ? typeDefs : [typeDefs];
+
+    // We augment the typeDefs with the @cacheControl directive and associated
+    // scope enum, so makeExecutableSchema won't fail SDL validation
+
+    if (!isDirectiveDefined(augmentedTypeDefs, 'cacheControl')) {
+      augmentedTypeDefs.push(
+        gql`
+          enum CacheControlScope {
+            PUBLIC
+            PRIVATE
+          }
+
+          directive @cacheControl(
+            maxAge: Int
+            scope: CacheControlScope
+          ) on FIELD_DEFINITION | OBJECT | INTERFACE
+        `,
+      );
+    }
+
+    if (this.uploadsConfig) {
+      const { GraphQLUpload } = require('@apollographql/graphql-upload-8-fork');
+      if (Array.isArray(resolvers)) {
+        if (resolvers.every((resolver) => !resolver.Upload)) {
+          resolvers.push({ Upload: GraphQLUpload });
+        }
+      } else {
+        if (resolvers && !resolvers.Upload) {
+          resolvers.Upload = GraphQLUpload;
+        }
+      }
+
+      // We augment the typeDefs with the Upload scalar, so typeDefs that
+      // don't include it won't fail
+      augmentedTypeDefs.push(
+        gql`
+          scalar Upload
+        `,
+      );
+    }
+
+    return makeExecutableSchema({
+      typeDefs: augmentedTypeDefs,
+      schemaDirectives,
+      resolvers,
+      parseOptions,
+    });
+  }
+
+  private generateSchemaDerivedData(schema: GraphQLSchema): SchemaDerivedData {
+    const schemaHash = generateSchemaHash(schema!);
+
+    const { mocks, mockEntireSchema, extensions: _extensions } = this.config;
+
+    if (mocks || (typeof mockEntireSchema !== 'undefined' && mocks !== false)) {
+      addMockFunctionsToSchema({
+        schema,
+        mocks:
+          typeof mocks === 'boolean' || typeof mocks === 'undefined'
+            ? {}
+            : mocks,
+        preserveResolvers:
+          typeof mockEntireSchema === 'undefined' ? false : !mockEntireSchema,
+      });
+    }
+
+    const extensions = [];
+
+    // Note: doRunQuery will add its own extensions if you set tracing,
+    // or cacheControl.
+    extensions.push(...(_extensions || []));
+
+    // Initialize the document store.  This cannot currently be disabled.
+    const documentStore = this.initializeDocumentStore();
+
+    return {
+      schema,
+      schemaHash,
+      extensions,
+      documentStore,
+    };
+  }
+
   public async stop() {
-    await Promise.all([...this.toDispose].map(dispose => dispose()));
+    await Promise.all([...this.toDispose].map((dispose) => dispose()));
     if (this.subscriptionServer) this.subscriptionServer.close();
   }
 
-  public installSubscriptionHandlers(server: HttpServer | HttpsServer | Http2Server | Http2SecureServer | WebSocket.Server) {
+  public installSubscriptionHandlers(
+    server:
+      | HttpServer
+      | HttpsServer
+      | Http2Server
+      | Http2SecureServer
+      | WebSocket.Server,
+  ) {
+    // FIXME this may need to "on-demand" start
     if (!this.subscriptionServerOptions) {
       if (this.config.gateway) {
         throw Error(
@@ -674,14 +650,14 @@ export class ApolloServerBase {
           return { ...connection, context };
         },
         keepAlive,
-        validationRules: this.requestOptions.validationRules
+        validationRules: this.requestOptions.validationRules,
       },
       server instanceof NetServer || server instanceof TlsServer
         ? {
-          server,
-          path,
-        }
-        : server
+            server,
+            path,
+          }
+        : server,
     );
   }
 
@@ -744,7 +720,7 @@ export class ApolloServerBase {
     // inline tracing plugin may be what you want, or just usage reporting if
     // the goal is to get traces to Apollo's servers.)
     if (this.config.tracing) {
-      pluginsToInit.push(pluginTracing())
+      pluginsToInit.push(pluginTracing());
     }
 
     // Enable cache control unless it was explicitly disabled.
@@ -780,7 +756,7 @@ export class ApolloServerBase {
 
     pluginsToInit.push(...plugins);
 
-    this.plugins = pluginsToInit.map(plugin => {
+    this.plugins = pluginsToInit.map((plugin) => {
       if (typeof plugin === 'function') {
         return plugin();
       }
@@ -838,7 +814,7 @@ export class ApolloServerBase {
               'Schema reporting is not yet compatible with federated services.',
               "If you're interested in using schema reporting with federated",
               'services, please contact Apollo support. To set up managed federation, see',
-              'https://go.apollo.dev/s/managed-federation'
+              'https://go.apollo.dev/s/managed-federation',
             ].join(' '),
           );
         }
@@ -848,7 +824,7 @@ export class ApolloServerBase {
               "Schema reporting is not yet compatible with the gateway. If you're",
               'interested in using schema reporting with the gateway, please',
               'contact Apollo support. To set up managed federation, see',
-              'https://go.apollo.dev/s/managed-federation'
+              'https://go.apollo.dev/s/managed-federation',
             ].join(' '),
           );
         }
@@ -931,8 +907,7 @@ export class ApolloServerBase {
       // for unicode characters, etc.), but it should do a reasonable job at
       // providing a caching document store for most operations.
       maxSize:
-        Math.pow(2, 20) *
-        (this.experimental_approximateDocumentStoreMiB || 30),
+        Math.pow(2, 20) * (this.experimental_approximateDocumentStoreMiB || 30),
       sizeCalculator: approximateObjectSize,
     });
   }
@@ -943,12 +918,9 @@ export class ApolloServerBase {
   protected async graphQLServerOptions(
     integrationContextArgument?: Record<string, any>,
   ): Promise<GraphQLServerOptions> {
-    const {
-      schema,
-      schemaHash,
-      documentStore,
-      extensions,
-    } = await this.schemaDerivedData;
+    // FIXME justify exclamation point
+    const { schema, schemaHash, documentStore, extensions } = this
+      .schemaDerivedData!;
 
     let context: Context = this.context ? this.context : {};
 
@@ -1000,7 +972,6 @@ export class ApolloServerBase {
       // NOTE: THIS IS DUPLICATED IN runHttpQuery.ts' buildRequestContext.
       options.context = cloneObject(options.context);
     }
-
 
     const requestCtx: GraphQLRequestContext = {
       logger: this.logger,

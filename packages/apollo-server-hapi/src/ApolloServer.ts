@@ -60,7 +60,7 @@ export class ApolloServer extends ApolloServerBase {
     disableHealthCheck,
     onHealthCheck,
   }: ServerRegistration) {
-    await this.willStart();
+    await this.start();  // FIXME maybe?
 
     if (!path) path = '/graphql';
 

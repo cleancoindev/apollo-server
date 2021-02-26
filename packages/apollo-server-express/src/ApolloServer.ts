@@ -136,11 +136,12 @@ export class ApolloServer extends ApolloServerBase {
     // `willStart` right away, so hopefully it'll finish before the first
     // request comes in, but we won't call `next` on this middleware until it
     // does. (And we'll take care to surface any errors via the `.catch`-able.)
-    const promiseWillStart = this.willStart();
+    // FIXME const promiseWillStart = this.willStart();
 
-    router.use(path, (_req, _res, next) => {
-      promiseWillStart.then(() => next()).catch(next);
-    });
+    // FIXME
+    // router.use(path, (_req, _res, next) => {
+    //   promiseWillStart.then(() => next()).catch(next);
+    // });
 
     if (!disableHealthCheck) {
       router.use('/.well-known/apollo/server-health', (req, res) => {

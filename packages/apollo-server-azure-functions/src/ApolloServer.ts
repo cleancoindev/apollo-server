@@ -39,7 +39,7 @@ export class ApolloServer extends ApolloServerBase {
     // We will kick off the `willStart` event once for the server, and then
     // await it before processing any requests by incorporating its `await` into
     // the GraphQLServerOptions function which is called before each request.
-    const promiseWillStart = this.willStart();
+    // const promiseWillStart = this.willStart();  // FIXME
 
     const corsHeaders: HttpResponse['headers'] = {};
 
@@ -145,7 +145,7 @@ export class ApolloServer extends ApolloServerBase {
         );
       };
       graphqlAzureFunction(async () => {
-        await promiseWillStart;
+        // await promiseWillStart; FIXME
         return this.createGraphQLServerOptions(req, context);
       })(context, req, callbackFilter);
     };
