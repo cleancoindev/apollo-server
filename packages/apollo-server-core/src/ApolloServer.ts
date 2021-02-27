@@ -138,8 +138,14 @@ type SchemaDerivedData = {
 }
 
 type ServerState =
-  | { phase: 'initialized' }
+  | { phase: 'initialized with schema'; schemaDerivedData: SchemaDerivedData }
+  | { phase: 'initialized with gateway'; gateway: GraphQLService }
   | { phase: 'starting'; barrier: Barrier }
+  | {
+      phase: 'invoking serverWillStart';
+      barrier: Barrier;
+      schemaDerivedData: SchemaDerivedData;
+    }
   | { phase: 'failed to start'; error: Error }
   | {
       phase: 'started';
@@ -386,7 +392,16 @@ export class ApolloServerBase {
       });
     }
 
-    this.state = { phase: 'initialized' };
+    if (gateway) {
+      this.state = { phase: 'initialized with gateway', gateway };
+    } else {
+      this.state = {
+        phase: 'initialized with schema',
+        schemaDerivedData: this.generateSchemaDerivedData(
+          this.constructSchema(),
+        ),
+      };
+    }
   }
 
   // used by integrations to synchronize the path with subscriptions, some
@@ -399,27 +414,43 @@ export class ApolloServerBase {
   // We must make sure that we manage the schemaDerivedData line before
   // awaiting in the !gateway case, for installSubscriptionHandlers reasons
   public async start(): Promise<void> {
+    const initialState = this.state;
+    if (
+      initialState.phase !== 'initialized with gateway' &&
+      initialState.phase !== 'initialized with schema'
+    ) {
+      throw new Error(
+        `called start() with surprising state ${initialState.phase}`,
+      );
+    }
     const barrier = new Barrier();
     this.state = { phase: 'starting', barrier };
     try {
-      const { gateway } = this.config;
-      const schema = gateway
-        ? await this.startGatewayAndLoadSchema(gateway)
-        : this.constructSchema();
-      const schemaDerivedData = this.generateSchemaDerivedData(schema);
-      if (!gateway) {
+      const schemaDerivedData =
+        initialState.phase === 'initialized with schema'
+          ? initialState.schemaDerivedData
+          : this.generateSchemaDerivedData(
+              await this.startGatewayAndLoadSchema(initialState.gateway),
+            );
+      if (initialState.phase === 'initialized with schema') {
         // This deprecated field was only ever set for non-gateway FIXME
         // It is read by installSubscriptionHandlers
         // IMPORTANT: For backwards compatibility, we want to support calling
         // installSubscriptionHandlers synchronously after the constructor
         // with no explicit start() so we must get to this line before
         // any await in the !gateway case. FIXME
-        this.schema = schema;
+        this.schema = schemaDerivedData.schema;
       }
+
+      this.state = {
+        phase: 'invoking serverWillStart',
+        barrier,
+        schemaDerivedData,
+      };
 
       const service: GraphQLServiceContext = {
         logger: this.logger,
-        schema: schema,
+        schema: schemaDerivedData.schema,
         schemaHash: schemaDerivedData.schemaHash,
         apollo: this.apolloConfig,
         serverlessFramework: this.serverlessFramework(),
@@ -473,11 +504,13 @@ export class ApolloServerBase {
   private async ensureStarted(): Promise<SchemaDerivedData> {
     while (true) {
       switch (this.state.phase) {
-        case 'initialized':
+        case 'initialized with gateway':
+        case 'initialized with schema':
           await this.start();
           // continue the while loop
           break;
         case 'starting':
+        case 'invoking serverWillStart':
           await this.state.barrier.wait();
           // continue the while loop
           break;
@@ -501,6 +534,7 @@ export class ApolloServerBase {
     // Store the unsubscribe handles, which are returned from
     // `onSchemaChange`, for later disposal when the server stops
     const unsubscriber = gateway.onSchemaChange((schema) => {
+      // If we're still happily running, update our schema-derived state.
       if (this.state.phase === 'started') {
         this.state.schemaDerivedData = this.generateSchemaDerivedData(schema);
       }
@@ -681,43 +715,30 @@ export class ApolloServerBase {
       path,
     } = this.subscriptionServerOptions;
 
+    let schema: GraphQLSchema;
     switch (this.state.phase) {
-      case 'initialized':
-        // We haven't called start yet. We'll call it right now. Because there's
-        // no gateway, start() guarantees synchronously that this.schema is set.
-        // (It does not guarantee that serverWillStart plugins have been run
-        // but this function doesn't care.)
-        this.start().catch((e) => console.error(`FIXME ${e}`));
-        if (!this.schema) {
-          throw new Error("start didn't set schema?");
-        }
-        break;
-      case 'starting':
+      case 'initialized with schema':
+      case 'invoking serverWillStart':
       case 'started':
-        // We've called but not awaited start(). Because we have no gateway, we
-        // should still have this.schema (though plugins may be running).
-        if (!this.schema) {
-          throw new Error(`Server in state ${this.state.phase} but no schema?`);
-        }
+        schema = this.state.schemaDerivedData.schema;
         break;
+      case 'initialized with gateway':
+      // shouldn't happen: gateway doesn't support subs
+      case 'starting':
+      // shouldn't happen: there's no await between 'starting' and
+      // 'invoking serverWillStart' without gateway
       case 'failed to start':
+      // only happens if you call 'start' yourself, in which case you really
+      // ought to see what happens before calling this function
       case 'stopping':
       case 'stopped':
-        // These cases are unlikely to happen in practice.
+        // stopping is unlikely to happen during startup
         throw new Error(
           `Can't install subscription handlers when state is ${this.state.phase}`,
         );
       default:
         throw new UnreachableCaseError(this.state);
     }
-
-    // This uses this.schema because it shows up while serverWillStart plugins
-    // are being run. This field won't be in AS3... but neither will this whole function.
-    const schema = this.schema;
-    if (!schema)
-      throw new Error(
-        'Schema undefined during creation of subscription server.',
-      );
 
     this.subscriptionServer = SubscriptionServer.create(
       {
