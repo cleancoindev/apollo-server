@@ -31,6 +31,20 @@ import { PersistedQueryNotFoundError } from "apollo-server-errors";
 
 export * from './ApolloServer';
 
+// FIXME should find somewhere better to put this (just publish a little package?)
+class Barrier {
+  private resolvePromise!: () => void;
+  private promise = new Promise<void>((r) => {
+    this.resolvePromise = r;
+  });
+  async wait() {
+    await this.promise;
+  }
+  unblock() {
+    this.resolvePromise();
+  }
+}
+
 export const NODE_MAJOR_VERSION: number = parseInt(
   process.versions.node.split('.', 1)[0],
   10,
@@ -1119,15 +1133,18 @@ export default (createApp: CreateAppFunc, destroyApp?: DestroyAppFunc) => {
 
     describe('request pipeline plugins', () => {
       describe('lifecycle hooks', () => {
+        // This tests the backwards-compatibility behavior that ensures
+        // that even if you don't call server.start() yourself, the first
+        // GraphQL request will result in starting the server before
+        // serving the first request
         it('calls serverWillStart before serving a request', async () => {
-          // We'll use this eventually-assigned function to programmatically
-          // resolve the `serverWillStart` event.
-          let resolveServerWillStart: Function;
-
-          // We'll use this mocked function to determine the order in which
+          // We'll use this to determine the order in which
           // the events we're expecting to happen actually occur and validate
           // those expectations in various stages of this test.
-          const fn = jest.fn();
+          const calls: string[] = [];
+
+          const pluginStartedBarrier = new Barrier;
+          const letPluginFinishBarrier = new Barrier;
 
           // We want this to create the app as fast as `createApp` will allow.
           // for integrations whose `applyMiddleware` currently returns a
@@ -1138,34 +1155,16 @@ export default (createApp: CreateAppFunc, destroyApp?: DestroyAppFunc) => {
               schema,
               plugins: [
                 {
-                  serverWillStart() {
-                    fn('zero');
-                    return new Promise(resolve => {
-                      resolveServerWillStart = () => {
-                        fn('one');
-                        resolve();
-                      };
-                    });
+                  async serverWillStart() {
+                    calls.push('zero');
+                    pluginStartedBarrier.unblock();
+                    await letPluginFinishBarrier.wait();
+                    calls.push('one');
                   },
                 },
               ],
             },
           });
-
-          const delayUntil = async (check: () => boolean, expectedNumTicks) => {
-            if (check()) return expect(expectedNumTicks).toBe(0);
-            else expect(expectedNumTicks).not.toBe(0);
-            return new Promise(resolve =>
-              process.nextTick(() =>
-                delayUntil(check, expectedNumTicks - 1).then(resolve),
-              ),
-            );
-          };
-
-          // Make sure that things were called in the expected order.
-          await delayUntil(() => fn.mock.calls.length === 1, 1);
-          expect(fn.mock.calls).toEqual([['zero']]);
-          resolveServerWillStart();
 
           // Account for the fact that `createApp` might return a Promise,
           // and might not, depending on the integration's implementation of
@@ -1185,18 +1184,23 @@ export default (createApp: CreateAppFunc, destroyApp?: DestroyAppFunc) => {
               query: 'query test{ testString }',
             })
             .then(res => {
-              fn('two');
+              calls.push('two');
               return res;
             });
 
-          // Ensure the request has not gone through.
-          expect(fn.mock.calls).toEqual([['zero'], ['one']]);
+          // Synchronously there should have been no calls, but once
+          // the request gets sent we should see serverWillStart start.
+          expect(calls).toEqual([]);
+
+          await pluginStartedBarrier.wait();
+          expect(calls).toEqual(['zero']);
+          letPluginFinishBarrier.unblock();
 
           // Now, wait for the request to finish.
           await res;
 
           // Finally, ensure that the order we expected was achieved.
-          expect(fn.mock.calls).toEqual([['zero'], ['one'], ['two']]);
+          expect(calls).toEqual(['zero', 'one', 'two']);
         });
       });
     });
