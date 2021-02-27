@@ -114,16 +114,48 @@ function approximateObjectSize<T>(obj: T): number {
   return Buffer.byteLength(JSON.stringify(obj), 'utf8');
 }
 
+class Barrier {
+  private resolvePromise!: () => void;
+  private promise = new Promise<void>((r) => {
+    this.resolvePromise = r;
+  });
+  async wait() {
+    await this.promise;
+  }
+  unblock() {
+    this.resolvePromise();
+  }
+}
+
 type SchemaDerivedData = {
+  schema: GraphQLSchema;
+  schemaHash: SchemaHash;
+  extensions: Array<() => GraphQLExtension>;
   // A store that, when enabled (default), will store the parsed and validated
   // versions of operations in-memory, allowing subsequent parses/validates
   // on the same operation to be executed immediately.
   documentStore?: InMemoryLRUCache<DocumentNode>;
-  schema: GraphQLSchema;
-  schemaHash: SchemaHash;
-  extensions: Array<() => GraphQLExtension>;
-};
+}
 
+type ServerState =
+  | { phase: 'initialized' }
+  | { phase: 'starting'; barrier: Barrier }
+  | { phase: 'failed to start'; error: Error }
+  | {
+      phase: 'started';
+      schemaDerivedData: SchemaDerivedData;
+    }
+  | { phase: 'stopping' }
+  | { phase: 'stopped' };
+
+// Throw this in places that should be unreachable (because all other cases have
+// been handled, reducing the type of the argument to `never`). TypeScript will
+// complain if in fact there is a valid type for the argument.
+class UnreachableCaseError extends Error {
+  constructor(val: never) {
+    super(`Unreachable case: ${val}`);
+  }
+}
 export class ApolloServerBase {
   private logger: Logger;
   public subscriptionsPath?: string;
@@ -146,9 +178,8 @@ export class ApolloServerBase {
   protected playgroundOptions?: PlaygroundRenderPageOptions;
 
   private parseOptions: GraphQLParseOptions;
-  // This is assigned when `start` returns successfully.
-  private schemaDerivedData?: SchemaDerivedData;
   private config: Config;
+  private state: ServerState;
   /** @deprecated: This is undefined for servers operating as gateways, and will be removed in a future release **/
   protected schema?: GraphQLSchema;
   private toDispose = new Set<() => Promise<void>>();
@@ -354,6 +385,8 @@ export class ApolloServerBase {
         });
       });
     }
+
+    this.state = { phase: 'initialized' };
   }
 
   // used by integrations to synchronize the path with subscriptions, some
@@ -366,58 +399,100 @@ export class ApolloServerBase {
   // We must make sure that we manage the schemaDerivedData line before
   // awaiting in the !gateway case, for installSubscriptionHandlers reasons
   public async start(): Promise<void> {
-    const { gateway } = this.config;
-    const schema = gateway
-      ? await this.startGatewayAndLoadSchema(gateway)
-      : this.constructSchema();
-    this.schemaDerivedData = this.generateSchemaDerivedData(schema);
-    if (!gateway) {
-      // This deprecated field was only ever set for non-gateway FIXME
-      this.schema = schema;
-    }
+    const barrier = new Barrier();
+    this.state = { phase: 'starting', barrier };
+    try {
+      const { gateway } = this.config;
+      const schema = gateway
+        ? await this.startGatewayAndLoadSchema(gateway)
+        : this.constructSchema();
+      const schemaDerivedData = this.generateSchemaDerivedData(schema);
+      if (!gateway) {
+        // This deprecated field was only ever set for non-gateway FIXME
+        // It is read by installSubscriptionHandlers
+        // IMPORTANT: For backwards compatibility, we want to support calling
+        // installSubscriptionHandlers synchronously after the constructor
+        // with no explicit start() so we must get to this line before
+        // any await in the !gateway case. FIXME
+        this.schema = schema;
+      }
 
-    const service: GraphQLServiceContext = {
-      logger: this.logger,
-      schema: schema,
-      schemaHash: this.schemaDerivedData.schemaHash,
-      apollo: this.apolloConfig,
-      serverlessFramework: this.serverlessFramework(),
-      engine: {
-        serviceID: this.apolloConfig.graphId,
-        apiKeyHash: this.apolloConfig.keyHash,
-      },
-    };
-
-    // The `persistedQueries` attribute on the GraphQLServiceContext was
-    // originally used by the operation registry, which shared the cache with
-    // it.  This is no longer the case.  However, while we are continuing to
-    // expand the support of the interface for `persistedQueries`, e.g. with
-    // additions like https://github.com/apollographql/apollo-server/pull/3623,
-    // we don't want to continually expand the API surface of what we expose
-    // to the plugin API.   In this particular case, it certainly doesn't need
-    // to get the `ttl` default value which are intended for APQ only.
-    if (this.requestOptions.persistedQueries?.cache) {
-      service.persistedQueries = {
-        cache: this.requestOptions.persistedQueries.cache,
+      const service: GraphQLServiceContext = {
+        logger: this.logger,
+        schema: schema,
+        schemaHash: schemaDerivedData.schemaHash,
+        apollo: this.apolloConfig,
+        serverlessFramework: this.serverlessFramework(),
+        engine: {
+          serviceID: this.apolloConfig.graphId,
+          apiKeyHash: this.apolloConfig.keyHash,
+        },
       };
-    }
 
-    const serverListeners = (
-      await Promise.all(
-        this.plugins.map(
-          (plugin) => plugin.serverWillStart && plugin.serverWillStart(service),
-        ),
-      )
-    ).filter(
-      (maybeServerListener): maybeServerListener is GraphQLServerListener =>
-        typeof maybeServerListener === 'object' &&
-        !!maybeServerListener.serverWillStop,
-    );
-    this.toDispose.add(async () => {
-      await Promise.all(
-        serverListeners.map(({ serverWillStop }) => serverWillStop?.()),
+      // The `persistedQueries` attribute on the GraphQLServiceContext was
+      // originally used by the operation registry, which shared the cache with
+      // it.  This is no longer the case.  However, while we are continuing to
+      // expand the support of the interface for `persistedQueries`, e.g. with
+      // additions like https://github.com/apollographql/apollo-server/pull/3623,
+      // we don't want to continually expand the API surface of what we expose
+      // to the plugin API.   In this particular case, it certainly doesn't need
+      // to get the `ttl` default value which are intended for APQ only.
+      if (this.requestOptions.persistedQueries?.cache) {
+        service.persistedQueries = {
+          cache: this.requestOptions.persistedQueries.cache,
+        };
+      }
+
+      const serverListeners = (
+        await Promise.all(
+          this.plugins.map(
+            (plugin) =>
+              plugin.serverWillStart && plugin.serverWillStart(service),
+          ),
+        )
+      ).filter(
+        (maybeServerListener): maybeServerListener is GraphQLServerListener =>
+          typeof maybeServerListener === 'object' &&
+          !!maybeServerListener.serverWillStop,
       );
-    });
+      this.toDispose.add(async () => {
+        await Promise.all(
+          serverListeners.map(({ serverWillStop }) => serverWillStop?.()),
+        );
+      });
+
+      this.state = { phase: 'started', schemaDerivedData };
+    } catch (error) {
+      this.state = { phase: 'failed to start', error };
+    } finally {
+      barrier.unblock();
+    }
+  }
+
+  // FIXME in AS3 this goes away
+  private async ensureStarted(): Promise<SchemaDerivedData> {
+    while (true) {
+      switch (this.state.phase) {
+        case 'initialized':
+          await this.start();
+          // continue the while loop
+          break;
+        case 'starting':
+          await this.state.barrier.wait();
+          // continue the while loop
+          break;
+        case 'failed to start':
+          throw this.state.error;
+        case 'started':
+          return this.state.schemaDerivedData;
+        case 'stopping':
+          throw new Error('Apollo Server is stopping');
+        case 'stopped':
+          throw new Error('Apollo Server has stopped');
+        default:
+          throw new UnreachableCaseError(this.state);
+      }
+    }
   }
 
   private async startGatewayAndLoadSchema(
@@ -426,7 +501,9 @@ export class ApolloServerBase {
     // Store the unsubscribe handles, which are returned from
     // `onSchemaChange`, for later disposal when the server stops
     const unsubscriber = gateway.onSchemaChange((schema) => {
-      this.schemaDerivedData = this.generateSchemaDerivedData(schema);
+      if (this.state.phase === 'started') {
+        this.state.schemaDerivedData = this.generateSchemaDerivedData(schema);
+      }
     });
     this.toDispose.add(async () => unsubscriber());
 
@@ -564,8 +641,11 @@ export class ApolloServerBase {
   }
 
   public async stop() {
+    // FIXME read state to make this idempotenty
+    this.state = { phase: 'stopping' };
     await Promise.all([...this.toDispose].map((dispose) => dispose()));
     if (this.subscriptionServer) this.subscriptionServer.close();
+    this.state = { phase: 'stopped' };
   }
 
   public installSubscriptionHandlers(
@@ -601,9 +681,40 @@ export class ApolloServerBase {
       path,
     } = this.subscriptionServerOptions;
 
-    // TODO: This shouldn't use this.schema, as it is deprecated in favor of the schemaDerivedData promise.
+    switch (this.state.phase) {
+      case 'initialized':
+        // We haven't called start yet. We'll call it right now. Because there's
+        // no gateway, start() guarantees synchronously that this.schema is set.
+        // (It does not guarantee that serverWillStart plugins have been run
+        // but this function doesn't care.)
+        this.start().catch((e) => console.error(`FIXME ${e}`));
+        if (!this.schema) {
+          throw new Error("start didn't set schema?");
+        }
+        break;
+      case 'starting':
+      case 'started':
+        // We've called but not awaited start(). Because we have no gateway, we
+        // should still have this.schema (though plugins may be running).
+        if (!this.schema) {
+          throw new Error(`Server in state ${this.state.phase} but no schema?`);
+        }
+        break;
+      case 'failed to start':
+      case 'stopping':
+      case 'stopped':
+        // These cases are unlikely to happen in practice.
+        throw new Error(
+          `Can't install subscription handlers when state is ${this.state.phase}`,
+        );
+      default:
+        throw new UnreachableCaseError(this.state);
+    }
+
+    // This uses this.schema because it shows up while serverWillStart plugins
+    // are being run. This field won't be in AS3... but neither will this whole function.
     const schema = this.schema;
-    if (this.schema === undefined)
+    if (!schema)
       throw new Error(
         'Schema undefined during creation of subscription server.',
       );
@@ -918,9 +1029,13 @@ export class ApolloServerBase {
   protected async graphQLServerOptions(
     integrationContextArgument?: Record<string, any>,
   ): Promise<GraphQLServerOptions> {
-    // FIXME justify exclamation point
-    const { schema, schemaHash, documentStore, extensions } = this
-      .schemaDerivedData!;
+    // FIXME should try/catch here and mask errors like we used to
+    const {
+      schema,
+      schemaHash,
+      documentStore,
+      extensions,
+    } = await this.ensureStarted();
 
     let context: Context = this.context ? this.context : {};
 
