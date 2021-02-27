@@ -19,8 +19,6 @@ import {
   ValidationContext,
   FieldDefinitionNode,
   DocumentNode,
-  isObjectType,
-  isScalarType,
 } from 'graphql';
 import { GraphQLExtension } from 'graphql-extensions';
 import {
@@ -806,38 +804,6 @@ export class ApolloServerBase {
     return false;
   }
 
-  // Returns true if it appears that the schema was returned from
-  // @apollo/federation's buildFederatedSchema. This strategy avoids depending
-  // explicitly on @apollo/federation or relying on something that might not
-  // survive transformations like monkey-patching a boolean field onto the
-  // schema.
-  //
-  // This is used for two things:
-  // 1) Determining whether traces should be added to responses if requested
-  //    with an HTTP header. If you want to include these traces even for
-  //    non-federated schemas (when requested via header) you can use
-  //    ApolloServerPluginInlineTrace yourself; if you want to never
-  //    include these traces even for federated schemas you can use
-  //    ApolloServerPluginInlineTraceDisabled.
-  // 2) Determining whether schema-reporting should be allowed; federated
-  //    services shouldn't be reporting schemas, and we accordingly throw if
-  //    it's attempted.
-  private schemaIsFederated(schema: GraphQLSchema): boolean {
-    const serviceType = schema.getType('_Service');
-    if (!(serviceType && isObjectType(serviceType))) {
-      return false;
-    }
-    const sdlField = serviceType.getFields().sdl;
-    if (!sdlField) {
-      return false;
-    }
-    const sdlFieldType = sdlField.type;
-    if (!isScalarType(sdlFieldType)) {
-      return false;
-    }
-    return sdlFieldType.name == 'String';
-  }
-
   private ensurePluginInstantiation(plugins: PluginDefinition[] = []): void {
     const pluginsToInit: PluginDefinition[] = [];
 
@@ -884,8 +850,6 @@ export class ApolloServerBase {
 
       pluginsToInit.push(pluginCacheControl(cacheControlOptions));
     }
-
-    const federatedSchema = this.schema && this.schemaIsFederated(this.schema);
 
     pluginsToInit.push(...plugins);
 
@@ -941,16 +905,6 @@ export class ApolloServerBase {
         typeof engine === 'object' &&
         (engine.reportSchema || engine.experimental_schemaReporting);
       if (alreadyHavePlugin || enabledViaEnvVar || enabledViaLegacyOption) {
-        if (federatedSchema) {
-          throw Error(
-            [
-              'Schema reporting is not yet compatible with federated services.',
-              "If you're interested in using schema reporting with federated",
-              'services, please contact Apollo support. To set up managed federation, see',
-              'https://go.apollo.dev/s/managed-federation',
-            ].join(' '),
-          );
-        }
         if (this.config.gateway) {
           throw new Error(
             [
@@ -1013,17 +967,15 @@ export class ApolloServerBase {
               'https://go.apollo.dev/s/migration-engine-plugins',
           );
         }
-      } else if (federatedSchema && this.config.engine !== false) {
-        // If we have a federated schema, and we haven't explicitly disabled inline
-        // tracing via ApolloServerPluginInlineTraceDisabled or engine:false,
-        // we set up inline tracing.
+      } else if (this.config.engine !== false) {
+        // If we haven't explicitly disabled inline tracing via
+        // ApolloServerPluginInlineTraceDisabled or engine:false,
+        // we set up inline tracing in "only if federated" mode.
         // (This is slightly different than the pre-ApolloServerPluginInlineTrace where
         // we would also avoid doing this if an API key was configured and log a warning.)
-        this.logger.info(
-          'Enabling inline tracing for this federated service. To disable, use ' +
-            'ApolloServerPluginInlineTraceDisabled.',
-        );
-        const options: ApolloServerPluginInlineTraceOptions = {};
+        const options: ApolloServerPluginInlineTraceOptions = {
+          __onlyIfSchemaIsFederated: true,
+        };
         if (typeof engine === 'object') {
           options.rewriteError = engine.rewriteError;
         }

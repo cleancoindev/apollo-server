@@ -2690,7 +2690,7 @@ export function testApolloServer<AS extends ApolloServerBase>(
         expect(result.extensions).toBeUndefined();
       });
 
-      it.only('reports a total duration that is longer than the duration of its resolvers', async () => {
+      it('reports a total duration that is longer than the duration of its resolvers', async () => {
         const { url: uri, server } = await createApolloServer({
           typeDefs: allTypeDefs,
           resolvers,
@@ -2703,7 +2703,6 @@ export function testApolloServer<AS extends ApolloServerBase>(
           query: `{ books { title author } }`,
         });
 
-        console.log("R", result)
         const ftv1: string = result.extensions.ftv1;
 
         expect(ftv1).toBeTruthy();
@@ -3328,7 +3327,8 @@ export function testApolloServer<AS extends ApolloServerBase>(
         const unsubscribeSpy = jest.fn();
         const { gateway, triggers } = makeGatewayMock({ unsubscribeSpy });
         triggers.resolveLoad({ schema, executor: () => {} });
-        await createApolloServer({ gateway, subscriptions: false });
+        const { server } = await createApolloServer({ gateway, subscriptions: false });
+        await server.start();
         expect(unsubscribeSpy).not.toHaveBeenCalled();
         await stopServer();
         expect(unsubscribeSpy).toHaveBeenCalled();

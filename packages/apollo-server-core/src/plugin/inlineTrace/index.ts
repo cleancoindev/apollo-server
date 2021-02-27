@@ -2,8 +2,13 @@ import { Trace } from 'apollo-reporting-protobuf';
 import { TraceTreeBuilder } from '../traceTreeBuilder';
 import type { ApolloServerPluginUsageReportingOptions } from '../usageReporting/options';
 import type { InternalApolloServerPlugin } from '../internalPlugin';
+import { schemaIsFederated } from '../schemaIsFederated';
 
 export interface ApolloServerPluginInlineTraceOptions {
+  /**
+   * FIXME doc or don't
+   */
+  __onlyIfSchemaIsFederated?: boolean;
   /**
    * By default, all errors from this service get included in the trace.  You
    * can specify a filter function to exclude specific errors from being
@@ -21,12 +26,28 @@ export interface ApolloServerPluginInlineTraceOptions {
 export function ApolloServerPluginInlineTrace(
   options: ApolloServerPluginInlineTraceOptions = Object.create(null),
 ): InternalApolloServerPlugin {
+  let enabled: boolean | null = options.__onlyIfSchemaIsFederated ? null : true;
   return {
     __internal_plugin_id__() {
       return 'InlineTrace';
     },
+    serverWillStart({ schema, logger }) {
+      if (enabled === null) {
+        enabled = schemaIsFederated(schema);
+        if (enabled) {
+          logger.info(
+            'Enabling inline tracing for this federated service. To disable, use ' +
+              'ApolloServerPluginInlineTraceDisabled.',
+          );
+        }
+      }
+    },
+    // FIXME ensure that serverWillStart always comes before requestDidStart
     requestDidStart({ request: { http } }) {
-      console.log("HI I AM EXTENDY")
+      if (!enabled) {
+        return;
+      }
+
       const treeBuilder = new TraceTreeBuilder({
         rewriteError: options.rewriteError,
       });
