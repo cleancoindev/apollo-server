@@ -26,6 +26,7 @@ export function ApolloServerPluginInlineTrace(
       return 'InlineTrace';
     },
     requestDidStart({ request: { http } }) {
+      console.log("HI I AM EXTENDY")
       const treeBuilder = new TraceTreeBuilder({
         rewriteError: options.rewriteError,
       });

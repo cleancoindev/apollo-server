@@ -495,6 +495,7 @@ export class ApolloServerBase {
       this.state = { phase: 'started', schemaDerivedData };
     } catch (error) {
       this.state = { phase: 'failed to start', error };
+      throw error;
     } finally {
       barrier.unblock();
     }
@@ -1050,13 +1051,30 @@ export class ApolloServerBase {
   protected async graphQLServerOptions(
     integrationContextArgument?: Record<string, any>,
   ): Promise<GraphQLServerOptions> {
-    // FIXME should try/catch here and mask errors like we used to
+    let schemaDerivedData: SchemaDerivedData;
+    try {
+      schemaDerivedData = await this.ensureStarted();
+    } catch (err) {
+      // We intentionally do not re-throw the exact error from the gateway
+      // configuration as it may contain implementation details and this error
+      // will propagate to the client. We will, however, log the error for
+      // observation in the logs.
+      // FIXME improve wording
+      this.logger.error(
+        'Apollo Server failed to start correctly. Consider calling `await server.start()` immediately after `server = new ApolloServer()` to make this error stop your server from starting up. ' +
+          ((err && err.message) || err),
+      );
+      throw new Error(
+        'This data graph is missing a valid configuration. More details may be available in the server logs.',
+      );
+    }
+
     const {
       schema,
       schemaHash,
       documentStore,
       extensions,
-    } = await this.ensureStarted();
+    } = schemaDerivedData;
 
     let context: Context = this.context ? this.context : {};
 

@@ -45,6 +45,7 @@ import {
   ApolloServerPluginInlineTrace,
   ApolloServerPluginUsageReporting,
   ApolloServerPluginUsageReportingOptions,
+  GraphQLServiceConfig,
 } from 'apollo-server-core';
 import { GraphQLExtension, GraphQLResponse } from 'graphql-extensions';
 import { TracingFormat } from 'apollo-tracing';
@@ -123,28 +124,31 @@ const makeGatewayMock = ({
   unsubscribeSpy?: () => void;
   executor?: GraphQLExecutor;
 } = {}) => {
+  let resolution: GraphQLServiceConfig | null = null;
+  let rejection: Error | null = null;
   const eventuallyAssigned = {
-    resolveLoad: null as ({ schema, executor }) => void,
-    rejectLoad: null as (err: Error) => void,
+    resolveLoad: (config: GraphQLServiceConfig) => {
+      resolution = config;
+    },
+    rejectLoad: (err: Error) => {
+      rejection = err;
+    },
     triggerSchemaChange: null as (newSchema) => void,
   };
-  const mockedLoadResults = new Promise<{
-    schema: GraphQLSchema;
-    executor: GraphQLExecutor;
-  }>((resolve, reject) => {
-    eventuallyAssigned.resolveLoad = ({ schema, executor }) => {
-      resolve({ schema, executor });
-    };
-    eventuallyAssigned.rejectLoad = (err: Error) => {
-      reject(err);
-    };
-  });
 
   const mockedGateway: GraphQLService = {
     executor,
-    load: options => {
+    load: async (options) => {
       optionsSpy(options);
-      return mockedLoadResults;
+      // Make sure it's async
+      await new Promise(res => setImmediate(res));
+      if (rejection) {
+        throw rejection;
+      }
+      if (resolution) {
+        return resolution;
+      }
+      throw Error("Neither resolving nor rejecting?");
     },
     onSchemaChange: callback => {
       eventuallyAssigned.triggerSchemaChange = callback;
@@ -387,6 +391,20 @@ export function testApolloServer<AS extends ApolloServerBase>(
           expect(executor).toHaveBeenCalled();
         });
 
+        it("rejected load promise is thrown by server.start", async () => {
+          const { gateway, triggers } = makeGatewayMock();
+
+          const loadError = new Error("load error which should be be thrown by start");
+          triggers.rejectLoad(loadError);
+
+          const { server } = await createApolloServer({
+            gateway,
+            subscriptions: false,
+          });
+
+          expect(server.start()).rejects.toThrowError(loadError);
+        });
+
         it("rejected load promise acts as an error boundary", async () => {
           const executor = jest.fn();
           executor.mockResolvedValueOnce(
@@ -423,7 +441,7 @@ export function testApolloServer<AS extends ApolloServerBase>(
             })
           );
           expect(consoleErrorSpy).toHaveBeenCalledWith(
-            "This data graph is missing a valid configuration. " +
+            "Apollo Server failed to start correctly. Consider calling `await server.start()` immediately after `server = new ApolloServer()` to make this error stop your server from starting up. " +
               "load error which should be masked");
           expect(executor).not.toHaveBeenCalled();
         });
@@ -2672,11 +2690,12 @@ export function testApolloServer<AS extends ApolloServerBase>(
         expect(result.extensions).toBeUndefined();
       });
 
-      it('reports a total duration that is longer than the duration of its resolvers', async () => {
-        const { url: uri } = await createApolloServer({
+      it.only('reports a total duration that is longer than the duration of its resolvers', async () => {
+        const { url: uri, server } = await createApolloServer({
           typeDefs: allTypeDefs,
           resolvers,
         });
+        await server.start();
 
         const apolloFetch = createApolloFetchAsIfFromGateway(uri);
 
@@ -2684,6 +2703,7 @@ export function testApolloServer<AS extends ApolloServerBase>(
           query: `{ books { title author } }`,
         });
 
+        console.log("R", result)
         const ftv1: string = result.extensions.ftv1;
 
         expect(ftv1).toBeTruthy();
@@ -3279,11 +3299,13 @@ export function testApolloServer<AS extends ApolloServerBase>(
 
         const { gateway, triggers } = makeGatewayMock({ optionsSpy });
         triggers.resolveLoad({ schema, executor: () => {} });
-        await createApolloServer({
+        const { server } = await createApolloServer({
           gateway,
           subscriptions: false,
           apollo: { key: 'service:tester:1234abc', graphVariant: 'staging' },
         });
+
+        await server.start();
 
         expect(optionsSpy).toHaveBeenLastCalledWith({
           apollo: {
